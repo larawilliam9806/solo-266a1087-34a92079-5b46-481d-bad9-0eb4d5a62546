@@ -9,9 +9,21 @@
   POST /api/match             在指定路网版本上执行匹配,生成连续路径与缺口
   GET  /api/analyses          按路网版本 / 轨迹查询历史分析
   GET  /            /api/analyses/{id} 查看分析结果(匹配路段、进入/离开时刻、里程、缺口原因)
+
+在线恢复(SQLite backup 接口整体替换库文件)下的 /api/match 一致性保证:
+  1. 每次匹配在一个显式读事务里从同一份快照读取路网与轨迹采样,读入内存后
+     立即释放连接;匹配计算期间不持有任何数据库锁,恢复与其他写请求可继续。
+  2. 同版路网按"内容+顺序指纹"缓存索引:指纹一致才复用,恢复导致内容或
+     顺序变化后指纹改变,索引自动重建。
+  3. 报告入库前在一个写事务(BEGIN IMMEDIATE)里按原请求重新核对当前库:
+     路网版本/轨迹仍存在且路段与采样的内容、顺序未变才提交;任一输入消失
+     或内容/顺序变化则回滚并返回 409,历史中不新增本次报告。无关数据
+     (其他轨迹、其他分析等)的变动不影响保存。
 """
 from __future__ import annotations
 
+import sqlite3
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
@@ -30,22 +42,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="车辆轨迹匹配 API", version="1.0.0", lifespan=lifespan)
 
-# 路网版本快照缓存:(db_path, network_id) -> NetworkIndex
-# 路网版本登记后不可变,因此缓存安全;匹配全程只使用同一快照,不路网修订不影响进行中的分析。
-_index_cache: dict[tuple[str, int], NetworkIndex] = {}
+# 路网版本快照缓存:(db_path, network_id, 路段内容指纹) -> NetworkIndex
+# 指纹覆盖路段的内容与顺序:完全一致时复用索引;在线恢复替换库后,即便
+# network_id/版本号被沿用,只要路段内容或顺序变化,指纹即不同,索引重建。
+# 同一 (库, 路网) 只保留最新指纹的条目;被替换的旧索引仍可由进行中的
+# 匹配继续持有,不会影响其快照一致性。
+_index_cache: dict[tuple[str, int, str], NetworkIndex] = {}
+_index_lock = threading.Lock()
 
 
-def get_index(network_id: int, seg_rows) -> NetworkIndex:
-    key = (db.db_path(), network_id)
-    idx = _index_cache.get(key)
+def get_index(network_id: int, seg_fp: str, seg_rows) -> NetworkIndex:
+    key = (db.db_path(), network_id, seg_fp)
+    with _index_lock:
+        idx = _index_cache.get(key)
     if idx is None:
         segments = [
-            Segment(r["segment_id"], r["start_lat"], r["start_lon"],
-                    r["end_lat"], r["end_lon"], r["length_m"])
-            for r in seg_rows
+            Segment(r[0], r[1], r[2], r[3], r[4], r[5]) for r in seg_rows
         ]
         idx = NetworkIndex(segments)
-        _index_cache[key] = idx
+        with _index_lock:
+            # 回收同一 (库, 路网) 的旧指纹条目,避免恢复后缓存无限增长
+            for old_key in [k for k in _index_cache
+                            if k[0] == key[0] and k[1] == network_id]:
+                _index_cache.pop(old_key, None)
+            _index_cache[key] = idx
     return idx
 
 
@@ -148,46 +168,116 @@ def get_trajectory(trajectory_id: int):
         conn.close()
 
 
-# ------------------------------------------------------------------ 匹配分析
+# 路段/采样的核对列:顺序固定,内容与顺序共同构成指纹。
+_SEG_COLS = ("segment_id", "start_lat", "start_lon", "end_lat", "end_lon", "length_m")
+_PT_COLS = ("ts", "lat", "lon")
+
+
 @app.post("/api/match", status_code=201)
 def run_match(body: MatchRequest):
     """在指定路网版本上执行轨迹匹配。
 
-    一次分析只读取该版本的路网快照,不混用其他版本;结果连同版本号一起落库,
-    之后路网修订不影响本次分析。
+    一次分析的全部输入(同版路网路段、轨迹采样)在同一个显式读事务里
+    从同一份数据库快照读入内存,匹配计算期间不持有数据库锁,因此在线
+    恢复、其他轨迹提交、其他分析保存都可以同时继续。
+
+    入库前另开写事务按原请求核对当前库:
+      - 路网版本仍存在、路段内容与顺序与快照一致;
+      - 轨迹仍存在、采样点内容与顺序与快照一致。
+    任一输入已不存在,或内容/顺序已变(典型场景:在线恢复后版本号、
+    轨迹 id 被沿用但底层数据已替换),返回 409 且不写入任何历史记录;
+    仅无关数据发生变化时照常保存。
     """
-    conn = db.connect()
+    # ------------------------------------------------ 1) 固定快照读取输入
+    conn = db.connect(autocommit=True)
     try:
-        traj = conn.execute("SELECT * FROM trajectories WHERE id = ?",
-                            (body.trajectory_id,)).fetchone()
+        conn.execute("BEGIN")  # 显式读事务:整个读取固定在同一份快照上
+        traj = conn.execute(
+            "SELECT id FROM trajectories WHERE id = ?", (body.trajectory_id,)
+        ).fetchone()
         if not traj:
+            conn.execute("ROLLBACK")
             raise HTTPException(404, f"轨迹 {body.trajectory_id} 不存在")
-        net = conn.execute("SELECT * FROM networks WHERE version = ?",
-                           (body.network_version,)).fetchone()
+        net = conn.execute(
+            "SELECT id, version FROM networks WHERE version = ?",
+            (body.network_version,),
+        ).fetchone()
         if not net:
+            conn.execute("ROLLBACK")
             raise HTTPException(404, f"路网版本 '{body.network_version}' 不存在")
-        # 一次性读入该版本快照:分析期间不混用版本
         seg_rows = conn.execute(
-            "SELECT * FROM segments WHERE network_id = ? ORDER BY id", (net["id"],)
+            f"SELECT {', '.join(_SEG_COLS)} FROM segments "
+            "WHERE network_id = ? ORDER BY id",
+            (net["id"],),
         ).fetchall()
         pt_rows = conn.execute(
-            "SELECT ts, lat, lon FROM trajectory_points WHERE trajectory_id = ? ORDER BY seq",
-            (traj["id"],)
+            f"SELECT {', '.join(_PT_COLS)} FROM trajectory_points "
+            "WHERE trajectory_id = ? ORDER BY seq",
+            (traj["id"],),
         ).fetchall()
+        # 物化为普通元组后即可脱离快照连接(浮点/文本均已在内存中)
+        seg_data = [tuple(r) for r in seg_rows]
+        pt_data = [tuple(r) for r in pt_rows]
+        conn.execute("COMMIT")
     finally:
         conn.close()
 
-    index = get_index(net["id"], seg_rows)
-    points = [TrackPoint(parse_ts(r["ts"]), r["lat"], r["lon"]) for r in pt_rows]
+    seg_fp = db.fingerprint(seg_data)
+    pt_fp = db.fingerprint(pt_data)
+
+    # ------------------------------------------------ 2) 无锁匹配计算
+    index = get_index(net["id"], seg_fp, seg_data)
+    points = [TrackPoint(parse_ts(r[0]), r[1], r[2]) for r in pt_data]
     result = index.match(points)
 
+    # -------------------------------- 3) 按原请求核对当前库后原子入库
     now = fmt_ts(utcnow())
-    conn = db.connect()
+    conn = db.connect(autocommit=True)
     try:
+        # 写锁 + 单事务:核对与入库原子完成,期间在线恢复无法穿插
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            raise HTTPException(409, "数据库正忙(可能正在在线恢复),"
+                                     "本次匹配结果未保存,请重试")
+
+        def conflict(detail: str) -> HTTPException:
+            # 核对失败:显式回滚,保证历史中不留下本次任何数据
+            conn.execute("ROLLBACK")
+            return HTTPException(409, detail)
+
+        cur_net = conn.execute(
+            "SELECT id, version FROM networks WHERE version = ?",
+            (body.network_version,),
+        ).fetchone()
+        if cur_net is None:
+            raise conflict("路网版本已不存在(数据库可能已在线恢复),本次匹配结果不予保存")
+        cur_seg = conn.execute(
+            f"SELECT {', '.join(_SEG_COLS)} FROM segments "
+            "WHERE network_id = ? ORDER BY id",
+            (cur_net["id"],),
+        ).fetchall()
+        if db.fingerprint([tuple(r) for r in cur_seg]) != seg_fp:
+            raise conflict("路网路段的内容或顺序已变化(数据库可能已在线恢复),"
+                           "本次匹配结果不予保存")
+        cur_traj = conn.execute(
+            "SELECT id FROM trajectories WHERE id = ?", (body.trajectory_id,)
+        ).fetchone()
+        if cur_traj is None:
+            raise conflict("轨迹已不存在(数据库可能已在线恢复),本次匹配结果不予保存")
+        cur_pts = conn.execute(
+            f"SELECT {', '.join(_PT_COLS)} FROM trajectory_points "
+            "WHERE trajectory_id = ? ORDER BY seq",
+            (cur_traj["id"],),
+        ).fetchall()
+        if db.fingerprint([tuple(r) for r in cur_pts]) != pt_fp:
+            raise conflict("轨迹采样的内容或顺序已变化(数据库可能已在线恢复),"
+                           "本次匹配结果不予保存")
+
         cur = conn.execute(
             "INSERT INTO analyses (trajectory_id, network_id, created_at, total_points, "
             "matched_points, total_distance_m) VALUES (?, ?, ?, ?, ?, ?)",
-            (traj["id"], net["id"], now, result["total_points"],
+            (cur_traj["id"], cur_net["id"], now, result["total_points"],
              result["matched_points"], result["total_distance_m"]),
         )
         aid = cur.lastrowid
@@ -203,12 +293,19 @@ def run_match(body: MatchRequest):
             [(aid, g["seq"], g["start_time"], g["end_time"], g["reason"])
              for g in result["gaps"]],
         )
-        conn.commit()
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError as exc:
+        # 核对/入库期间与在线恢复或其他写者竞争且超时:回滚并提示重试
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise HTTPException(409, f"数据库正忙(可能正在在线恢复),本次匹配结果未保存,请重试: {exc}")
     finally:
         conn.close()
 
-    return {"analysis_id": aid, "trajectory_id": traj["id"],
-            "network_version": net["version"], "created_at": now, **result}
+    return {"analysis_id": aid, "trajectory_id": cur_traj["id"],
+            "network_version": cur_net["version"], "created_at": now, **result}
 
 
 @app.get("/api/analyses")
